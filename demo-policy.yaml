@@ -1,0 +1,14 @@
+default: deny
+redact:
+  - type: builtin
+    name: bearer
+  - type: builtin
+    name: email
+agents:
+  researcher:
+    allow:
+      - GET localhost:9999/search
+      - POST localhost:9999/search
+    hold:
+      - DELETE *
+      - POST localhost:9999/orders/*

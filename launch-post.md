@@ -1,9 +1,3 @@
----
-title: "I put a firewall in front of my AI agents. Here is the near-miss that made me build it."
-published: false
-tags: ["ai", "security", "infrastructure", "agents", "opensource"]
----
-
 Your agents can delete, spend, email, and leak — at machine speed, without asking.
 
 Nothing is standing in front of them.
