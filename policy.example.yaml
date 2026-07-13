@@ -1,0 +1,23 @@
+default: deny
+
+redact:
+  - type: builtin
+    name: bearer
+  - type: builtin
+    name: jwt
+  - type: builtin
+    name: email
+
+agents:
+  researcher:
+    allow:
+      - GET api.internal/search
+      - GET api.internal/documents/*
+    hold:
+      - POST api.internal/orders/*
+      - DELETE *
+
+  analyst:
+    allow:
+      - GET api.internal/reports/*
+    # nothing else — denied by default
