@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0.0",
+  "identity": {
+    "principal": {"name": "alice", "type": "human"},
+    "auth_method": "oidc",
+    "role": "operator"
+  },
+  "event_context": {
+    "start_timestamp": "2026-07-15T09:00:00Z",
+    "end_timestamp": "2026-07-15T09:00:01Z",
+    "correlation_id": "corr-123",
+    "session_id": "session-123",
+    "bastion_version": "1.0.0",
+    "policy_version": "2026-07-01"
+  },
+  "decision_content": {
+    "action": "allow",
+    "tool_or_model": "policy-engine",
+    "model_version": "1.0.0",
+    "input_summary": "read request",
+    "output_summary": "request approved"
+  },
+  "reason": {"reason_code": "POLICY_ALLOW", "rationale": "request matches policy"},
+  "references": {"provenance_ids": ["prov-1"], "dataset_ids": ["data-1"], "prompt_ids": ["prompt-1"]},
+  "integrity": {"record_hash": "hash-1", "previous_record_hash": "", "signature": "signature-1", "signing_key_id": "key-1"}
+}
