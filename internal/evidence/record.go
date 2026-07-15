@@ -58,6 +58,6 @@ type References struct {
 type Integrity struct {
 	RecordHash         string `json:"record_hash"`
 	PreviousRecordHash string `json:"previous_record_hash"`
-	Signature          string `json:"signature"`
+	Signature          string `json:"signature,omitempty"`
 	SigningKeyID       string `json:"signing_key_id"`
 }

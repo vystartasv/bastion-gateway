@@ -28,15 +28,31 @@ type UpstreamResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// OversightRecord tracks a human override/approval (Track 4, Art 14).
+type OversightRecord struct {
+	RequestID      string `json:"request_id"`
+	CorrelationID  string `json:"correlation_id"`
+	ApproverName   string `json:"approver_name"`
+	ApproverRole   string `json:"approver_role"`
+	Decision       string `json:"decision"` // approved / denied / overridden
+	Reason         string `json:"reason"`
+	Timestamp      string `json:"timestamp"`
+	LinkedRecordID string `json:"linked_record_id"`
+}
+
 type Store struct {
-	dir string
+	dir           string
+	oversightFile string
 }
 
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create approval dir: %w", err)
 	}
-	return &Store{dir: dir}, nil
+	return &Store{
+		dir:           dir,
+		oversightFile: filepath.Join(dir, "oversight.log"),
+	}, nil
 }
 
 func (s *Store) Queue(req *Request) error {
@@ -51,28 +67,29 @@ func (s *Store) Queue(req *Request) error {
 }
 
 func (s *Store) Approve(requestID, upstreamURL string) (*Request, error) {
-	req, err := s.load(requestID)
-	if err != nil {
-		return nil, err
+	return s.resolve(requestID, "approved", "", "")
+}
+
+// ApproveWithOversight approves with full Art 14 tracking.
+func (s *Store) ApproveWithOversight(requestID, approverName, approverRole, reason string) (*Request, error) {
+	if reason == "" {
+		return nil, fmt.Errorf("reason is required for oversight")
 	}
-	if req.Status != "pending" {
-		return nil, fmt.Errorf("request %s is not pending (status: %s)", requestID, req.Status)
-	}
-	req.Status = "approved"
-	s.save(req)
-	return req, nil
+	return s.resolve(requestID, "approved", approverName, reason)
 }
 
 func (s *Store) Deny(requestID string) error {
-	req, err := s.load(requestID)
-	if err != nil {
-		return err
+	_, err := s.resolve(requestID, "denied", "", "")
+	return err
+}
+
+// DenyWithOversight denies with full Art 14 tracking.
+func (s *Store) DenyWithOversight(requestID, approverName, approverRole, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("reason is required for oversight")
 	}
-	if req.Status != "pending" {
-		return fmt.Errorf("request %s is not pending (status: %s)", requestID, req.Status)
-	}
-	req.Status = "denied"
-	return s.save(req)
+	_, err := s.resolve(requestID, "denied", approverName, reason)
+	return err
 }
 
 func (s *Store) List() []*Request {
@@ -88,6 +105,41 @@ func (s *Store) List() []*Request {
 		}
 	}
 	return reqs
+}
+
+// resolve updates the request status and writes an oversight record if approverName is set.
+func (s *Store) resolve(requestID, newStatus, approverName, reason string) (*Request, error) {
+	req, err := s.load(requestID)
+	if err != nil {
+		return nil, err
+	}
+	if req.Status != "pending" {
+		return nil, fmt.Errorf("request %s is not pending (status: %s)", requestID, req.Status)
+	}
+	req.Status = newStatus
+	if err := s.save(req); err != nil {
+		return nil, err
+	}
+
+	// Write oversight record if approver is named
+	if approverName != "" {
+		o := OversightRecord{
+			RequestID:    requestID,
+			Decision:     newStatus,
+			ApproverName: approverName,
+			ApproverRole: approverName, // ponytail: role = name for v1, revisit if RBAC needed
+			Reason:       reason,
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		}
+		data, _ := json.Marshal(o)
+		f, err := os.OpenFile(s.oversightFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err == nil {
+			f.Write(append(data, '\n'))
+			f.Close()
+		}
+	}
+
+	return req, nil
 }
 
 func (s *Store) load(requestID string) (*Request, error) {
