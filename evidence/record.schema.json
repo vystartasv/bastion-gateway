@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bastiongateway.com/evidence/record.schema.json",
+  "title": "Bastion Evidence Record",
+  "type": "object",
+  "required": ["schema_version", "identity", "event_context", "decision_content", "reason", "references", "integrity"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "1.0.0"},
+    "identity": {"type": "object", "required": ["principal", "auth_method", "role"], "properties": {"principal": {"type": "object", "required": ["name", "type"], "properties": {"name": {"type": "string"}, "type": {"type": "string", "enum": ["human", "delegated"]}}}, "auth_method": {"type": "string"}, "role": {"type": "string"}}},
+    "event_context": {"type": "object", "required": ["start_timestamp", "end_timestamp", "correlation_id", "bastion_version", "policy_version"], "properties": {"start_timestamp": {"type": "string", "format": "date-time"}, "end_timestamp": {"type": "string", "format": "date-time"}, "correlation_id": {"type": "string"}, "session_id": {"type": "string"}, "bastion_version": {"type": "string"}, "policy_version": {"type": "string"}}},
+    "decision_content": {"type": "object", "required": ["action", "tool_or_model", "model_version", "input_summary", "output_summary"], "properties": {"action": {"type": "string", "enum": ["allow", "block", "queue", "redact"]}, "tool_or_model": {"type": "string"}, "model_version": {"type": "string"}, "input_summary": {"type": "string"}, "output_summary": {"type": "string"}, "input_envelope": {"type": "object"}, "output_envelope": {"type": "object"}}},
+    "reason": {"type": "object", "required": ["reason_code", "rationale"], "properties": {"reason_code": {"type": "string"}, "rationale": {"type": "string"}}},
+    "references": {"type": "object", "properties": {"provenance_ids": {"type": "array", "items": {"type": "string"}}, "dataset_ids": {"type": "array", "items": {"type": "string"}}, "prompt_ids": {"type": "array", "items": {"type": "string"}}}},
+    "integrity": {"type": "object", "required": ["record_hash", "previous_record_hash", "signature", "signing_key_id"], "properties": {"record_hash": {"type": "string"}, "previous_record_hash": {"type": "string"}, "signature": {"type": "string"}, "signing_key_id": {"type": "string"}}}
+  }
+}
