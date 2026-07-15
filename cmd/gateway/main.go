@@ -2,25 +2,32 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/vystartasv/bastion-gateway/internal/approval"
 	"github.com/vystartasv/bastion-gateway/internal/audit"
+	"github.com/vystartasv/bastion-gateway/internal/evidence"
 	"github.com/vystartasv/bastion-gateway/internal/policy"
 	"github.com/vystartasv/bastion-gateway/internal/proxy"
 	"github.com/vystartasv/bastion-gateway/internal/redact"
 )
 
 var (
-	pol           *policy.Policy
-	auditStore    *audit.Store
-	approvalStore *approval.Store
-	redactEngine  *redact.Engine
-	agentHeader   = "X-Bastion-Agent"
+	pol              *policy.Policy
+	auditStore       *audit.Store
+	approvalStore    *approval.Store
+	redactEngine     *redact.Engine
+	agentHeader      = "X-Bastion-Agent"
+	sessionID        string
+	bastionVersion   = "1.0.0"
+	identityResolver *evidence.IdentityResolver
 )
 
 func main() {
@@ -29,6 +36,12 @@ func main() {
 	auditDir := getEnv("AUDIT_DIR", "/var/bastion/audit")
 	approvalDir := getEnv("APPROVAL_DIR", "/var/bastion/approvals")
 	signKeyPath := getEnv("SIGN_KEY", "/var/bastion/signing.key")
+	identitiesPath := getEnv("IDENTITIES", "")
+	requirePrincipal := getEnv("REQUIRE_PRINCIPAL", "false") == "true"
+
+	// Session identity
+	hostname, _ := os.Hostname()
+	sessionID = fmt.Sprintf("%s-%d", hostname, os.Getpid())
 
 	var err error
 	pol, err = policy.Load(policyPath)
@@ -64,6 +77,9 @@ func main() {
 	redactEngine = redact.ParseRedactRules(redactRules)
 	log.Printf("Redaction: %d rules loaded", len(redactRules))
 
+	// Build identity resolver (Track 2 evidence layer)
+	identityResolver = evidence.NewIdentityResolver(identitiesPath, requirePrincipal)
+
 	// Generate signing key if it doesn't exist
 	if _, err := os.Stat(signKeyPath); os.IsNotExist(err) {
 		log.Printf("Generating new signing key: %s", signKeyPath)
@@ -95,16 +111,54 @@ func main() {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now().UTC()
+
 	reqID := proxy.NewRequestID()
 	agentID := proxy.ExtractAgentID(r, agentHeader)
 	body, _ := proxy.CopyBody(r)
 
+	// Evidence: correlation ID
+	correlationID := evidence.EnsureCorrelationID(r)
+
 	// Redact
 	redactedBody, redactMatch := redactEngine.Apply(body)
+
+	// Evidence: build record
+	policyVersion := "2026-07-13" // static for v1; Track 3 will make it dynamic
+	builder := evidence.NewRecordBuilder(correlationID, sessionID, bastionVersion, policyVersion)
+
+	// Resolve identity
+	bearerToken := ""
+	if tok := r.Header.Get("Authorization"); strings.HasPrefix(tok, "Bearer ") {
+		bearerToken = tok[7:]
+	}
+	ident := identityResolver.Resolve(agentID, bearerToken)
+	if ident.Err != nil {
+		// requirePrincipal=true and no identity -> 403
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{
+			"bastion": "denied",
+			"reason":  "unattributed",
+		})
+		// Still log the evidence record
+		builder.SetIdentity(ident).
+			SetDecision("block", r.Method+" "+r.Host+r.URL.Path, "", "").
+			SetInput(r.Method, r.Host, r.URL.Path, r.Header, redactedBody).
+			SetOutput(403, nil, ident.Err).
+			SetTimestamps(startTime, time.Now().UTC())
+		record := builder.Build()
+		logRecord(record)
+		return
+	}
+	builder.SetIdentity(ident)
 
 	// Evaluate policy
 	result := pol.Evaluate(agentID, r.Method, r.Host, r.URL.Path)
 
+	// Build evidence input (after redaction)
+	builder.SetInput(r.Method, r.Host, r.URL.Path, r.Header, redactedBody)
+
+	// Build v1 audit record (kept for backward compat — Track 3 removes it)
 	auditRec := audit.Record{
 		RequestID:   reqID,
 		AgentID:     agentID,
@@ -123,9 +177,15 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			auditRec.UpstreamError = err.Error()
 			http.Error(w, `{"bastion":"upstream_error"}`, 502)
+			builder.SetDecision("allow", r.Method+" "+r.Host+r.URL.Path, "", result.Rule).
+				SetOutput(code, upstreamBody, err).
+				SetTimestamps(startTime, time.Now().UTC())
 		} else {
 			w.WriteHeader(code)
 			w.Write(upstreamBody)
+			builder.SetDecision("allow", r.Method+" "+r.Host+r.URL.Path, "", result.Rule).
+				SetOutput(code, upstreamBody, nil).
+				SetTimestamps(startTime, time.Now().UTC())
 		}
 	case string(policy.Hold):
 		req := &approval.Request{
@@ -143,15 +203,34 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			"bastion":    "held",
 			"request_id": reqID,
 		})
+		builder.SetDecision("queue", r.Method+" "+r.Host+r.URL.Path, "", result.Rule).
+			SetOutput(http.StatusAccepted, nil, nil).
+			SetTimestamps(startTime, time.Now().UTC())
 	default: // DENY
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{
 			"bastion":    "denied",
 			"request_id": reqID,
 		})
+		builder.SetDecision("block", r.Method+" "+r.Host+r.URL.Path, "", result.Rule).
+			SetOutput(http.StatusForbidden, nil, nil).
+			SetTimestamps(startTime, time.Now().UTC())
 	}
 
+	// Append v1 audit record (kept for backward compat)
 	auditStore.Append(auditRec)
+
+	// Log evidence record to stdout (Track 3 will persist to ledger)
+	record := builder.Build()
+	if err := evidence.Validate(*record); err != nil {
+		log.Printf("EVIDENCE VALIDATION ERROR: %v", err)
+	}
+	logRecord(record)
+}
+
+func logRecord(r *evidence.EvidenceRecord) {
+	data, _ := json.Marshal(r)
+	log.Printf("EVIDENCE: %s", string(data))
 }
 
 func flattenHeaders(h http.Header) map[string]string {
