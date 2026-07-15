@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/vystartasv/bastion-gateway/internal/approval"
-	"github.com/vystartasv/bastion-gateway/internal/audit"
 	"github.com/vystartasv/bastion-gateway/internal/evidence"
 	"github.com/vystartasv/bastion-gateway/internal/policy"
 	"github.com/vystartasv/bastion-gateway/internal/proxy"
@@ -21,23 +21,29 @@ import (
 
 var (
 	pol              *policy.Policy
-	auditStore       *audit.Store
 	approvalStore    *approval.Store
 	redactEngine     *redact.Engine
 	agentHeader      = "X-Bastion-Agent"
 	sessionID        string
 	bastionVersion   = "1.0.0"
 	identityResolver *evidence.IdentityResolver
+	evidenceLedger   *evidence.Ledger
 )
 
 func main() {
 	port := getEnv("PORT", "8080")
 	policyPath := getEnv("POLICY", "/policy.yaml")
-	auditDir := getEnv("AUDIT_DIR", "/var/bastion/audit")
+	evidenceDir := getEnv("EVIDENCE_DIR", "/var/bastion/evidence")
 	approvalDir := getEnv("APPROVAL_DIR", "/var/bastion/approvals")
 	signKeyPath := getEnv("SIGN_KEY", "/var/bastion/signing.key")
 	identitiesPath := getEnv("IDENTITIES", "")
 	requirePrincipal := getEnv("REQUIRE_PRINCIPAL", "false") == "true"
+	retentionDays := getEnvInt("EVIDENCE_RETENTION_DAYS", 183)
+
+	// Retention floor check (Art 26(6))
+	if retentionDays < 183 {
+		log.Fatalf("EVIDENCE_RETENTION_DAYS (%d) below minimum 183 (6 months per Art 26(6))", retentionDays)
+	}
 
 	// Session identity
 	hostname, _ := os.Hostname()
@@ -49,11 +55,6 @@ func main() {
 		log.Fatalf("FAILED: policy load: %v", err)
 	}
 	log.Printf("Policy loaded: %s", policyPath)
-
-	auditStore, err = audit.NewStore(auditDir, signKeyPath)
-	if err != nil {
-		log.Fatalf("FAILED: audit store: %v", err)
-	}
 
 	approvalStore, err = approval.NewStore(approvalDir)
 	if err != nil {
@@ -77,16 +78,27 @@ func main() {
 	redactEngine = redact.ParseRedactRules(redactRules)
 	log.Printf("Redaction: %d rules loaded", len(redactRules))
 
-	// Build identity resolver (Track 2 evidence layer)
+	// Build identity resolver
 	identityResolver = evidence.NewIdentityResolver(identitiesPath, requirePrincipal)
 
-	// Generate signing key if it doesn't exist
+	// Setup evidence ledger (Track 3)
+	var signer evidence.Signer
 	if _, err := os.Stat(signKeyPath); os.IsNotExist(err) {
 		log.Printf("Generating new signing key: %s", signKeyPath)
-		if err := audit.GenerateKey(signKeyPath); err != nil {
+		if err := evidence.GenerateKey(signKeyPath); err != nil {
 			log.Fatalf("generate key: %v", err)
 		}
 	}
+	signer, err = evidence.NewEd25519Signer(signKeyPath)
+	if err != nil {
+		log.Fatalf("FAILED: signer: %v", err)
+	}
+
+	storage, err := evidence.NewFileStorage(evidenceDir)
+	if err != nil {
+		log.Fatalf("FAILED: evidence storage: %v", err)
+	}
+	evidenceLedger = evidence.NewLedger(storage, signer, evidenceDir)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleRequest)
@@ -101,6 +113,7 @@ func main() {
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		log.Println("Shutting down...")
+		evidenceLedger.Close()
 		server.Close()
 	}()
 
@@ -124,7 +137,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	redactedBody, redactMatch := redactEngine.Apply(body)
 
 	// Evidence: build record
-	policyVersion := "2026-07-13" // static for v1; Track 3 will make it dynamic
+	policyVersion := getEnv("POLICY_VERSION", "2026-07-13")
 	builder := evidence.NewRecordBuilder(correlationID, sessionID, bastionVersion, policyVersion)
 
 	// Resolve identity
@@ -134,20 +147,18 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	ident := identityResolver.Resolve(agentID, bearerToken)
 	if ident.Err != nil {
-		// requirePrincipal=true and no identity -> 403
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{
 			"bastion": "denied",
 			"reason":  "unattributed",
 		})
-		// Still log the evidence record
 		builder.SetIdentity(ident).
 			SetDecision("block", r.Method+" "+r.Host+r.URL.Path, "", "").
 			SetInput(r.Method, r.Host, r.URL.Path, r.Header, redactedBody).
 			SetOutput(403, nil, ident.Err).
 			SetTimestamps(startTime, time.Now().UTC())
 		record := builder.Build()
-		logRecord(record)
+		persistRecord(record, redactMatch.Count)
 		return
 	}
 	builder.SetIdentity(ident)
@@ -158,24 +169,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Build evidence input (after redaction)
 	builder.SetInput(r.Method, r.Host, r.URL.Path, r.Header, redactedBody)
 
-	// Build v1 audit record (kept for backward compat — Track 3 removes it)
-	auditRec := audit.Record{
-		RequestID:   reqID,
-		AgentID:     agentID,
-		Method:      r.Method,
-		Host:        r.Host,
-		Path:        r.URL.Path,
-		Decision:    string(result.Decision),
-		MatchedRule: result.Rule,
-		RedactCount: redactMatch.Count,
-	}
-
 	switch string(result.Decision) {
 	case string(policy.Allow):
 		code, upstreamBody, err := proxy.Forward("https://"+r.Host+r.URL.Path, r.Method, redactedBody, r.Header)
-		auditRec.UpstreamCode = code
 		if err != nil {
-			auditRec.UpstreamError = err.Error()
 			http.Error(w, `{"bastion":"upstream_error"}`, 502)
 			builder.SetDecision("allow", r.Method+" "+r.Host+r.URL.Path, "", result.Rule).
 				SetOutput(code, upstreamBody, err).
@@ -217,19 +214,19 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			SetTimestamps(startTime, time.Now().UTC())
 	}
 
-	// Append v1 audit record (kept for backward compat)
-	auditStore.Append(auditRec)
-
-	// Log evidence record to stdout (Track 3 will persist to ledger)
+	// Persist evidence record to ledger
 	record := builder.Build()
+	persistRecord(record, redactMatch.Count)
+}
+
+func persistRecord(record *evidence.EvidenceRecord, redactCount int) {
 	if err := evidence.Validate(*record); err != nil {
 		log.Printf("EVIDENCE VALIDATION ERROR: %v", err)
 	}
-	logRecord(record)
-}
-
-func logRecord(r *evidence.EvidenceRecord) {
-	data, _ := json.Marshal(r)
+	if err := evidenceLedger.Append(record); err != nil {
+		log.Printf("EVIDENCE LEDGER ERROR: %v", err)
+	}
+	data, _ := json.Marshal(record)
 	log.Printf("EVIDENCE: %s", string(data))
 }
 
@@ -246,6 +243,15 @@ func flattenHeaders(h http.Header) map[string]string {
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getEnvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }
