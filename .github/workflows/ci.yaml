@@ -14,6 +14,18 @@ jobs:
     - uses: actions/setup-go@v5
       with:
         go-version: '1.22'
+    - name: Claims lint
+      run: |
+        FORBIDDEN=$(jq -r '.forbidden[]' claims.json | paste -sd '|' -)
+        if grep -rE "$FORBIDDEN" --include='*.md' --include='*.yaml' --include='*.go' . ; then
+          echo "ERROR: Forbidden claim found. Check claims.json for the list."
+          exit 1
+        fi
+        if grep -iE "compli""ant|certi""fied|guaran""tee" Dockerfile; then
+          echo "ERROR: Forbidden claim found in Dockerfile."
+          exit 1
+        fi
+        echo "Claims lint passed"
     - run: go test ./...
     - run: go build ./cmd/gateway/
     - run: go build ./cmd/bastion/

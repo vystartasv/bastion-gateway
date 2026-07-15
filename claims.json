@@ -1,0 +1,12 @@
+{
+  "permitted": [
+    "helps meet", "supports", "produces evidence for",
+    "enables record-keeping", "structured, signed decision records",
+    "tamper-evident audit trail", "in-path evidence production"
+  ],
+  "forbidden": [
+    "makes you compliant", "makes you GDPR compliant",
+    "certified", "guarantees", "legally sufficient",
+    "fully compliant", "compliance solution"
+  ]
+}
